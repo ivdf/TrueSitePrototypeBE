@@ -1,11 +1,14 @@
-from fastapi import APIRouter, Depends, HTTPException, status, Query
+from fastapi import APIRouter, Depends, HTTPException, status, Query, BackgroundTasks
 from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy.orm import Session
 from datetime import datetime, timezone, timedelta
 import secrets
 
 from database import get_db, User
-from schemas import RegisterRequest, LoginRequest, TokenResponse, UserPublic, PasswordChangeRequest, ForgotPasswordRequest, ResetPasswordPayload
+from schemas import (
+    RegisterRequest, LoginRequest, TokenResponse, UserPublic, 
+    PasswordChangeRequest, ForgotPasswordRequest, ResetPasswordPayload
+)
 from security import (
     hash_password, verify_password,
     check_password_strength, is_password_breached,
@@ -24,6 +27,7 @@ LOCKOUT_MAX_ATTEMPTS = 5
 @router.post("/register", status_code=201)
 def register(
     payload: RegisterRequest,
+    background_tasks: BackgroundTasks,  # Added for non-blocking email
     db: Session = Depends(get_db)
 ):
     print("\n" + "="*60)
@@ -31,7 +35,7 @@ def register(
     print("="*60)
 
     # 1. Check email uniqueness
-    existing_user = db.query(User).filter(User.Email == payload.email).first()
+    existing_user = db.query(User).filter(User.Email == payload.email.lower().strip()).first()
     if existing_user:
         print(f"❌ Email already exists: {payload.email}")
         raise HTTPException(status_code=409, detail="Email already registered.")
@@ -75,50 +79,26 @@ def register(
         print(f"❌ Database error: {e}")
         raise HTTPException(status_code=409, detail="Email already registered.")
 
-    # 6. Build verification link + print to backend console (dev mode)
-    verify_link = f"http://localhost:5173/verify-email?token={verification_token}"
-    print()
-    print("=" * 70)
-    print("📧  EMAIL VERIFICATION LINK (dev mode — would be emailed in production)")
-    print("=" * 70)
-    print(f"   To:      {user.Email}")
-    print(f"   Link:    {verify_link}")
-    print(f"   Expires: {verification_expires.strftime('%Y-%m-%d %H:%M UTC')}")
-    print("=" * 70)
-    print()
+    # 6. Print link to console for debugging
+    verify_link = f"https://truesiteprototypefe.pages.dev/verify-email?token={verification_token}"
+    print(f"🔗 Verification link: {verify_link}")
 
-    # 7. Try to send the verification email (optional — works if SMTP configured)
-    email_sent = False
-    try:
-        if hasattr(EmailService, "send_verification_email"):
-            email_sent = EmailService.send_verification_email(
-                user_email=user.Email,
-                full_name=user.full_name,
-                verification_token=verification_token,
-            )
-    except Exception as e:
-        print(f"⚠️ Could not send verification email: {e}")
-
-    if email_sent:
-        print(f"✅ Verification email delivered to {user.Email}")
-    else:
-        print(
-            f"❌ Verification email NOT sent to {user.Email}. "
-            f"Check MAIL_USERNAME/MAIL_PASSWORD in .env."
-        )
-        # If DEBUG=true, still print the link as a fallback.
-        import os as _os
-        if _os.getenv("DEBUG", "false").lower() == "true":
-            print(f"   DEBUG link: http://localhost:5173/verify-email?token={verification_token}")
-
-    print(f"✅ Registration complete for {user.Email}")
+    # 7. Send the verification email in the BACKGROUND (non-blocking)
+    background_tasks.add_task(
+        EmailService.send_verification_email,
+        user_email=user.Email,
+        full_name=user.full_name,
+        verification_token=verification_token
+    )
+    
+    print(f"✅ Registration complete for {user.Email}. Email sending in background.")
     print("="*60 + "\n")
 
-    # 8. Do NOT return an access token — user must verify first
     return {
         "message": "Registration successful. Please check your email to verify your account.",
         "email":   user.Email,
     }
+
 # ── Login ─────────────────────────────────────────────────────────────────
 @router.post("/login", response_model=TokenResponse)
 def login(payload: LoginRequest, db: Session = Depends(get_db)):
@@ -134,7 +114,7 @@ def login(payload: LoginRequest, db: Session = Depends(get_db)):
     # Control 5: lockout check before any password verification
     check_lockout(user, db)
 
-       # Verify password
+    # Verify password
     if not verify_password(payload.password, user.password_hash):
         record_failed_attempt(user, db)   # Control 5: increment counter
         remaining = LOCKOUT_MAX_ATTEMPTS - (user.failed_attempts or 0)
@@ -152,7 +132,6 @@ def login(payload: LoginRequest, db: Session = Depends(get_db)):
             detail="Email not verified. Please check your inbox for the verification link.",
         )
 
-
     # Successful login — reset counter (Control 5) and issue token (Control 1)
     reset_failed_attempts(user, db)
     token = create_access_token({"sub": user.Email, "role": user.Role})
@@ -161,17 +140,15 @@ def login(payload: LoginRequest, db: Session = Depends(get_db)):
     return TokenResponse(
         access_token=token,
         user=UserPublic.model_validate(user),
-        force_password_change=bool(user.must_change_password),   # NEW
+        force_password_change=bool(user.must_change_password),
     )
 
-# ── OAuth2-compatible login (for Swagger's Authorize button) ─────────────
+# ── OAuth2-compatible login ───────────────────────────────────────────────
 @router.post("/token")
 def login_oauth2(
     form_data: OAuth2PasswordRequestForm = Depends(),
     db: Session = Depends(get_db),
 ):
-    """OAuth2 password-flow endpoint used by Swagger's Authorize dialog.
-    Treats the OAuth2 'username' field as the email."""
     payload = LoginRequest(email=form_data.username, password=form_data.password)
     result = login(payload, db)
     return {
@@ -211,12 +188,11 @@ def change_password(
         )
 
     current_user.password_hash = hash_password(payload.new_password)
-    current_user.must_change_password = False   # NEW — clear the force-change flag
+    current_user.must_change_password = False
     db.commit()
     
     print(f"✅ Password changed successfully for {current_user.Email}")
     
-    # Send confirmation email
     try:
         EmailService.send_password_change_confirmation(
             user_email=current_user.Email,
@@ -229,7 +205,7 @@ def change_password(
     return {"message": "Password updated successfully."}
 
 
-# ── Forgot Password (Step 1: Request a Link) ───────────────────────────
+# ── Forgot Password ───────────────────────────────────────────────────────
 @router.post("/forgot-password", status_code=200)
 def forgot_password(
     payload: ForgotPasswordRequest, 
@@ -239,24 +215,19 @@ def forgot_password(
     
     user = db.query(User).filter(User.Email == payload.email.lower().strip()).first()
     
-    # Security note: Use an anti-enumeration response string.
-    # We always return success to avoid telling hackers if an email exists.
     success_msg = {"message": "If that email exists in our records, a reset link has been sent."}
     
     if not user:
         print(f"⚠️ Password reset requested for non-existent email: {payload.email}")
         return success_msg
 
-    # Generate an un-guessable 32-character security token
     reset_token = secrets.token_urlsafe(32)
-    
     user.reset_token = reset_token
     user.reset_token_expires = datetime.now(timezone.utc) + timedelta(hours=1)
     db.commit()
     
     print(f"📧 Sending password reset email to: {user.Email}")
 
-    # Send password reset email
     try:
         result = EmailService.send_password_reset_email(
             user_email=user.Email,
@@ -273,28 +244,31 @@ def forgot_password(
     return success_msg
 
 
-# ── Reset Password (Step 2: Process New Password) ──────────────────────
+# ── Reset Password ────────────────────────────────────────────────────────
 @router.post("/reset-password", status_code=200)
 def reset_password(payload: ResetPasswordPayload, db: Session = Depends(get_db)):
     print(f"\n🔄 RESET PASSWORD for email: {payload.email}")
     
     user = db.query(User).filter(User.Email == payload.email.lower().strip()).first()
     
-    # Validate token existence and alignment
-    import secrets as _secrets
-    if not user or not _secrets.compare_digest(
-        getattr(user, 'reset_token', '') or '',
-        payload.token,
-    ):
+    # Validate token existence
+    if not user or not user.reset_token:
+        raise HTTPException(status_code=400, detail="Invalid token or email association.")
+        
+    # Constant-time token comparison
+    if not secrets.compare_digest(user.reset_token, payload.token):
         print(f"❌ Reset password failed: Invalid token for {payload.email}")
         raise HTTPException(status_code=400, detail="Invalid token or email association.")
         
     # Check expiry window
-    if user.reset_token_expires and datetime.now(timezone.utc) > user.reset_token_expires.replace(tzinfo=timezone.utc):
-        print(f"❌ Reset password failed: Token expired for {payload.email}")
-        raise HTTPException(status_code=400, detail="The password reset link has expired.")
+    if user.reset_token_expires:
+        expires = user.reset_token_expires
+        if expires.tzinfo is None:
+            expires = expires.replace(tzinfo=timezone.utc)
+        if datetime.now(timezone.utc) > expires:
+            print(f"❌ Reset password failed: Token expired for {payload.email}")
+            raise HTTPException(status_code=400, detail="The password reset link has expired.")
 
-    # Enforce standard application security policies
     strong, reason = check_password_strength(payload.new_password)
     if not strong:
         print(f"❌ Reset password failed: New password too weak")
@@ -307,11 +281,10 @@ def reset_password(payload: ResetPasswordPayload, db: Session = Depends(get_db))
             detail="This password has appeared in a known data breach. Please choose a different password.",
         )
 
-    # Apply changes, wipe tokens, and clear lockouts
     user.password_hash = hash_password(payload.new_password)
     user.reset_token = None
     user.reset_token_expires = None
-    reset_failed_attempts(user, db)  # Unlock account if locked due to failed attempts
+    reset_failed_attempts(user, db)
     
     db.commit()
     print(f"✅ Password reset successful for {user.Email}")
@@ -319,10 +292,9 @@ def reset_password(payload: ResetPasswordPayload, db: Session = Depends(get_db))
     return {"message": "Password updated successfully. You can now log in."}
 
 
-# ── Test Email Endpoint (for debugging) ─────────────────────────────────
+# ── Test Email Endpoint ───────────────────────────────────────────────────
 @router.post("/test-email")
 def test_email(email: str):
-    """Test endpoint to verify email sending"""
     print(f"\n🧪 TEST EMAIL endpoint called for: {email}")
     try:
         result = EmailService.send_welcome_email(
@@ -335,23 +307,21 @@ def test_email(email: str):
             return {"success": False, "message": "Email sending failed - check credentials"}
     except Exception as e:
         return {"success": False, "message": f"Error: {str(e)}"}
-# ── Verify Email ──────────────────────────────────────────────────────────
+
+
+# ── Verify Email (FIXED) ──────────────────────────────────────────────────
 @router.get("/verify-email", status_code=200)
 def verify_email(token: str = Query(...), db: Session = Depends(get_db)):
     """
     Called when the user clicks the verification link.
     Sets is_email_verified = TRUE and clears the token.
-    Single-use: the token is deleted after successful verification.
     """
     print(f"\n📧 VERIFY EMAIL attempt with token: {token[:12]}...")
 
-    import secrets as _secrets
-    if not user or not _secrets.compare_digest(
-        getattr(user, 'verification_token', '') or '',
-        token,
-    ):
-        raise HTTPException(400, "Invalid verification link.")
+    # 1. Fetch the user from the database
+    user = db.query(User).filter(User.verification_token == token).first()
 
+    # 2. If no user is found, the token is invalid or already used
     if not user:
         print("❌ Verification failed: Token not found (or already used)")
         raise HTTPException(
@@ -359,7 +329,7 @@ def verify_email(token: str = Query(...), db: Session = Depends(get_db)):
             detail="Invalid verification link. It may have already been used.",
         )
 
-    # Check expiry
+    # 3. Check expiry
     if user.verification_token_expires:
         expires = user.verification_token_expires
         if expires.tzinfo is None:
@@ -371,7 +341,7 @@ def verify_email(token: str = Query(...), db: Session = Depends(get_db)):
                 detail="Verification link has expired. Please register again or request a new link.",
             )
 
-    # Mark verified + clear token
+    # 4. Mark verified + clear token
     user.is_email_verified          = True
     user.verification_token         = None
     user.verification_token_expires = None
@@ -381,4 +351,4 @@ def verify_email(token: str = Query(...), db: Session = Depends(get_db)):
     return {
         "message": "Email verified successfully. You can now log in.",
         "email":   user.Email,
-    }        
+    }
