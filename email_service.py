@@ -1,5 +1,6 @@
 # email_service.py
 import smtplib
+import ssl
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 import os
@@ -7,6 +8,8 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# Centralized frontend URL
+FRONTEND_URL = "https://truesiteprototypefe.pages.dev"
 
 class EmailService:
     # ─────────────────────────────────────────────────────────────────────
@@ -36,7 +39,7 @@ class EmailService:
                     <h2>Hello {full_name}!</h2>
                     <p>Thank you for joining TrueSite — your AI-powered phishing detection platform.</p>
                     <p>You get <strong>5 free analyses per day</strong> to start with.</p>
-                    <center><a href="http://localhost:5173" class="button">Start Analyzing →</a></center>
+                    <center><a href="{FRONTEND_URL}" class="button">Start Analyzing →</a></center>
                 </div>
                 <div class="footer">
                     <p>TrueSite - University of Technology and Applied Sciences</p>
@@ -50,7 +53,7 @@ class EmailService:
     @staticmethod
     def send_verification_email(user_email: str, full_name: str, verification_token: str):
         """Send email verification link to a newly registered user."""
-        verify_url = f"http://localhost:5173/verify-email?token={verification_token}"
+        verify_url = f"{FRONTEND_URL}/verify-email?token={verification_token}"
         subject = "Verify your TrueSite account"
         html_content = f"""
         <!DOCTYPE html>
@@ -97,7 +100,7 @@ class EmailService:
 
     @staticmethod
     def send_password_reset_email(user_email: str, full_name: str, reset_token: str):
-        reset_url = f"http://localhost:5173/reset-password?token={reset_token}&email={user_email}"
+        reset_url = f"{FRONTEND_URL}/reset-password?token={reset_token}&email={user_email}"
         subject = "Password Reset Request - TrueSite"
         html_content = f"""
         <!DOCTYPE html>
@@ -171,7 +174,7 @@ class EmailService:
                         Confidence: {int(confidence * 100)}%<br>
                         Risk Score: {int(risk_score * 100)}%
                     </div>
-                    <center><a href="http://localhost:5173" class="button">View Full Analysis →</a></center>
+                    <center><a href="{FRONTEND_URL}" class="button">View Full Analysis →</a></center>
                 </div>
                 <div class="footer">
                     <p>TrueSite - University of Technology and Applied Sciences</p>
@@ -205,7 +208,7 @@ class EmailService:
                     <h2>Hello {full_name}!</h2>
                     <p>Your TrueSite account password has been successfully changed.</p>
                     <p>If you did not make this change, please contact our support team immediately.</p>
-                    <center><a href="http://localhost:5173" class="button">Go to TrueSite →</a></center>
+                    <center><a href="{FRONTEND_URL}" class="button">Go to TrueSite →</a></center>
                 </div>
                 <div class="footer">
                     <p>TrueSite - University of Technology and Applied Sciences</p>
@@ -223,10 +226,11 @@ class EmailService:
     def _send_email(to_email: str, subject: str, html_content: str):
         try:
             smtp_server = os.getenv("MAIL_SERVER", "smtp.gmail.com")
-            smtp_port   = int(os.getenv("MAIL_PORT", "587"))
-            username    = os.getenv("MAIL_USERNAME")
-            password    = os.getenv("MAIL_PASSWORD")
-            from_email  = os.getenv("MAIL_FROM") or username
+            # Default to 465 for Render compatibility
+            smtp_port = int(os.getenv("MAIL_PORT", "465"))
+            username = os.getenv("MAIL_USERNAME")
+            password = os.getenv("MAIL_PASSWORD")
+            from_email = os.getenv("MAIL_FROM") or username
 
             if not username or not password:
                 print(f"⚠️  Email credentials missing (MAIL_USERNAME/MAIL_PASSWORD).")
@@ -239,8 +243,16 @@ class EmailService:
             msg['To']      = to_email
             msg.attach(MIMEText(html_content, 'html'))
 
-            server = smtplib.SMTP(smtp_server, smtp_port, timeout=15)
-            server.starttls()
+            # Connect using SSL (Port 465) or TLS (Port 587)
+            if smtp_port == 465:
+                print(f"Connecting to {smtp_server} via SSL on port {smtp_port}...")
+                context = ssl.create_default_context()
+                server = smtplib.SMTP_SSL(smtp_server, smtp_port, context=context, timeout=15)
+            else:
+                print(f"Connecting to {smtp_server} via TLS on port {smtp_port}...")
+                server = smtplib.SMTP(smtp_server, smtp_port, timeout=15)
+                server.starttls()
+
             server.login(username, password)
             server.send_message(msg)
             server.quit()
