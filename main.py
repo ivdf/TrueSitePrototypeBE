@@ -46,18 +46,15 @@ class NoCacheMiddleware(BaseHTTPMiddleware):
 # ── CORS ──────────────────────────────────────────────────────────────────
 FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5173")
 
+from fastapi.middleware.cors import CORSMiddleware
+
 app.add_middleware(
     CORSMiddleware,
-    # Add your actual Cloudflare URL right here as a string:
-    allow_origins=[
-        "https://truesiteprototypefe.pages.dev/", 
-        FRONTEND_URL, 
-        "http://localhost:5173", 
-        "http://localhost:3000"
-    ],
-    allow_credentials=True,
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
+    allow_credentials=False,  # CRITICAL: Must be False when origins is "*"
+    expose_headers=["*"],
 )
 app.add_middleware(NoCacheMiddleware)
 
